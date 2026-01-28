@@ -383,6 +383,23 @@ class OpenAIServingChat(OpenAIServing):
                         sampling_params,
                     )
 
+                    # Apply GPT-OSS bad_words token IDs for tool_choice="required"
+                    # This is set by OpenAIToolParser.adjust_request()
+                    if (
+                        request.vllm_xargs
+                        and "_gptoss_bad_words_token_ids" in request.vllm_xargs
+                    ):
+                        gptoss_bad_words = request.vllm_xargs[
+                            "_gptoss_bad_words_token_ids"
+                        ]
+                        # Merge with existing bad_words_token_ids if any
+                        if sampling_params._bad_words_token_ids is None:
+                            sampling_params._bad_words_token_ids = gptoss_bad_words
+                        else:
+                            sampling_params._bad_words_token_ids.extend(
+                                gptoss_bad_words
+                            )
+
                 self._log_inputs(
                     sub_request_id,
                     engine_prompt,
