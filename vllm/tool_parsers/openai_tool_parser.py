@@ -40,9 +40,8 @@ class OpenAIToolParser(ToolParser):
         self._final_token_id = self._encode_single_token("final")
         self._analysis_token_id = self._encode_single_token("analysis")
         self._commentary_token_ids = self._encode_tokens("commentary")
-        # Some tokenizers represent a space as its own token (or multiple tokens).
-        # Cache it so we can block any whitespace immediately after <|channel|>.
-        self._space_token_ids = self._encode_tokens(" ")
+        self._final_token_w_space_id = self._encode_single_token(" final")
+        self._analysis_token_w_space_id = self._encode_single_token(" analysis")
 
     def _encode_single_token(self, text: str) -> int | None:
         """Encode text and return token ID if it's a single token."""
@@ -69,6 +68,8 @@ class OpenAIToolParser(ToolParser):
         Use bad_words token sequences to block non-tool-call paths:
         - Block <|end|><|start|>assistant<|channel|>final (new message to final)
         - Block <|end|><|start|>assistant<|channel|>analysis (new message to analysis)
+        - Block <|end|><|start|>assistant<|channel|> final (new message to final with space)
+        - Block <|end|><|start|>assistant<|channel|> analysis (new message to analysis with space)
         - Block commentary<|message|> (commentary without recipient)
 
         This allows first message to use analysis channel for reasoning,
@@ -95,12 +96,6 @@ class OpenAIToolParser(ToolParser):
             _CHANNEL_TOKEN_ID,  # <|channel|>
         ]
 
-        # Block <|end|><|start|>assistant<|channel|><space>
-        if self._space_token_ids is not None:
-            seq = new_msg_prefix + list(self._space_token_ids)
-            bad_sequences.append(seq)
-            logger.debug(f"Blocking whitespace after channel: {seq}")
-
         # Block <|end|><|start|>assistant<|channel|>final
         if self._final_token_id is not None:
             seq = new_msg_prefix + [self._final_token_id]
@@ -112,6 +107,18 @@ class OpenAIToolParser(ToolParser):
             seq = new_msg_prefix + [self._analysis_token_id]
             bad_sequences.append(seq)
             logger.debug(f"Blocking new message to analysis: {seq}")
+
+        # Block <|end|><|start|>assistant<|channel|> final
+        if self._final_token_w_space_id is not None:
+            seq = new_msg_prefix + [self._final_token_w_space_id]
+            bad_sequences.append(seq)
+            logger.debug(f"Blocking new message to final with space: {seq}")
+
+        # Block <|end|><|start|>assistant<|channel|> analysis
+        if self._analysis_token_w_space_id is not None:
+            seq = new_msg_prefix + [self._analysis_token_w_space_id]
+            bad_sequences.append(seq)
+            logger.debug(f"Blocking new message to analysis with space: {seq}")
 
         # Block commentary<|message|> (without recipient)
         if self._commentary_token_ids is not None:
@@ -210,3 +217,4 @@ class OpenAIToolParser(ToolParser):
         raise NotImplementedError(
             "Not being used, manual parsing in serving_chat.py"  # noqa: E501
         )
+    
