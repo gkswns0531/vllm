@@ -40,6 +40,9 @@ class OpenAIToolParser(ToolParser):
         self._final_token_id = self._encode_single_token("final")
         self._analysis_token_id = self._encode_single_token("analysis")
         self._commentary_token_ids = self._encode_tokens("commentary")
+        # Some tokenizers represent a space as its own token (or multiple tokens).
+        # Cache it so we can block any whitespace immediately after <|channel|>.
+        self._space_token_ids = self._encode_tokens(" ")
 
     def _encode_single_token(self, text: str) -> int | None:
         """Encode text and return token ID if it's a single token."""
@@ -91,6 +94,12 @@ class OpenAIToolParser(ToolParser):
             _ASSISTANT_TOKEN_ID,  # assistant
             _CHANNEL_TOKEN_ID,  # <|channel|>
         ]
+
+        # Block <|end|><|start|>assistant<|channel|><space>
+        if self._space_token_ids is not None:
+            seq = new_msg_prefix + list(self._space_token_ids)
+            bad_sequences.append(seq)
+            logger.debug(f"Blocking whitespace after channel: {seq}")
 
         # Block <|end|><|start|>assistant<|channel|>final
         if self._final_token_id is not None:
