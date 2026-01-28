@@ -36,13 +36,22 @@ class OpenAIToolParser(ToolParser):
         # Pre-compute token IDs for channel names
         self._final_token_id = self._encode_single_token("final")
         self._analysis_token_id = self._encode_single_token("analysis")
-        self._commentary_token_id = self._encode_single_token("commentary")
+        # commentary may be multiple tokens (e.g., [12606, 815])
+        self._commentary_token_ids = self._encode_tokens("commentary")
 
     def _encode_single_token(self, text: str) -> int | None:
         """Encode text and return token ID if it's a single token."""
         try:
             ids = self.model_tokenizer.encode(text, add_special_tokens=False)
             return ids[0] if len(ids) == 1 else None
+        except Exception:
+            return None
+
+    def _encode_tokens(self, text: str) -> list[int] | None:
+        """Encode text and return all token IDs."""
+        try:
+            ids = self.model_tokenizer.encode(text, add_special_tokens=False)
+            return ids if ids else None
         except Exception:
             return None
 
@@ -93,11 +102,14 @@ class OpenAIToolParser(ToolParser):
             )
 
         # Block commentary<|message|> (preamble without recipient)
-        if self._commentary_token_id is not None:
-            bad_sequences.append([self._commentary_token_id, _MESSAGE_TOKEN_ID])
+        # commentary may be multiple tokens (e.g., [12606, 815] for "commentary")
+        if self._commentary_token_ids is not None:
+            # Append <|message|> to the commentary token sequence
+            commentary_message_seq = self._commentary_token_ids + [_MESSAGE_TOKEN_ID]
+            bad_sequences.append(commentary_message_seq)
             logger.debug(
-                f"Blocking sequence: [commentary, <|message|>] = "
-                f"[{self._commentary_token_id}, {_MESSAGE_TOKEN_ID}]"
+                f"Blocking sequence: [commentary..., <|message|>] = "
+                f"{commentary_message_seq}"
             )
 
         # 3. Store in vllm_xargs for later application to SamplingParams

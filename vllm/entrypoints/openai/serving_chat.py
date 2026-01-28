@@ -331,6 +331,10 @@ class OpenAIServingChat(OpenAIServing):
                 conversation, engine_prompts = self._make_request_with_harmony(
                     request, should_include_tools
                 )
+                # GPT-OSS: Call adjust_request for tool_choice="required" support
+                # This sets _gptoss_bad_words_token_ids in request.vllm_xargs
+                if tool_parser is not None:
+                    request = tool_parser(tokenizer).adjust_request(request=request)
         except (ValueError, TypeError, RuntimeError, jinja2.TemplateError) as e:
             logger.exception("Error in preprocessing prompt inputs")
             return self.create_error_response(f"{e} {e.__cause__}")
