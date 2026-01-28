@@ -25,9 +25,8 @@ else:
 logger = init_logger(__name__)
 
 
-# GPT-OSS Harmony special token IDs
+# GPT-OSS Harmony special token ID
 _CHANNEL_TOKEN_ID = 200005   # <|channel|>
-_MESSAGE_TOKEN_ID = 200008   # <|message|>
 
 
 class OpenAIToolParser(ToolParser):
@@ -36,8 +35,6 @@ class OpenAIToolParser(ToolParser):
         # Pre-compute token IDs for channel names
         self._final_token_id = self._encode_single_token("final")
         self._analysis_token_id = self._encode_single_token("analysis")
-        # commentary may be multiple tokens (e.g., [12606, 815])
-        self._commentary_token_ids = self._encode_tokens("commentary")
 
     def _encode_single_token(self, text: str) -> int | None:
         """Encode text and return token ID if it's a single token."""
@@ -47,42 +44,27 @@ class OpenAIToolParser(ToolParser):
         except Exception:
             return None
 
-    def _encode_tokens(self, text: str) -> list[int] | None:
-        """Encode text and return all token IDs."""
-        try:
-            ids = self.model_tokenizer.encode(text, add_special_tokens=False)
-            return ids if ids else None
-        except Exception:
-            return None
-
     def adjust_request(
         self, request: ChatCompletionRequest
     ) -> ChatCompletionRequest:
         """
         Override adjust_request for GPT-OSS tool_choice="required".
 
-        Instead of using JSON schema bitmask (which doesn't work well with
-        Harmony format), we use bad_words token sequences to block
-        non-tool-call paths:
+        Use bad_words token sequences to block non-tool-call paths:
         - Block <|channel|>final (direct response)
         - Block <|channel|>analysis (reasoning only)
-        - Block commentary<|message|> (preamble without tool call)
         """
         if not request.tools:
             return request
 
-        # For tool_choice != "required", use default behavior (JSON schema)
+        # For tool_choice != "required", use default behavior
         if request.tool_choice != "required":
             return super().adjust_request(request)
 
         # For tool_choice="required", use bad_words approach
         logger.debug("GPT-OSS tool_choice=required: using bad_words approach")
 
-        # 1. Disable JSON schema (bitmask) - GPT-OSS uses Harmony format
-        request.structured_outputs = None
-        request.response_format = None
-
-        # 2. Build bad_words token sequences
+        # Build bad_words token sequences
         bad_sequences: list[list[int]] = []
 
         # Block <|channel|>final
@@ -101,18 +83,7 @@ class OpenAIToolParser(ToolParser):
                 f"[{_CHANNEL_TOKEN_ID}, {self._analysis_token_id}]"
             )
 
-        # Block commentary<|message|> (preamble without recipient)
-        # commentary may be multiple tokens (e.g., [12606, 815] for "commentary")
-        if self._commentary_token_ids is not None:
-            # Append <|message|> to the commentary token sequence
-            commentary_message_seq = self._commentary_token_ids + [_MESSAGE_TOKEN_ID]
-            bad_sequences.append(commentary_message_seq)
-            logger.debug(
-                f"Blocking sequence: [commentary..., <|message|>] = "
-                f"{commentary_message_seq}"
-            )
-
-        # 3. Store in vllm_xargs for later application to SamplingParams
+        # Store in vllm_xargs for later application to SamplingParams
         if bad_sequences:
             if request.vllm_xargs is None:
                 request.vllm_xargs = {}
