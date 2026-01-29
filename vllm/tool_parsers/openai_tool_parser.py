@@ -70,38 +70,15 @@ class OpenAIToolParser(ToolParser):
         """
         Build configuration for HarmonyToolChoiceLogitsProcessor.
 
-        This creates a config that forces "commentary to=" after detecting
-        the trigger sequence "<|end|><|start|>assistant<|channel|>".
+        This creates a config that immediately forces "commentary to=" as the
+        first tokens of generation. The prompt already ends with
+        "<|start|>assistant<|channel|>", so we use immediate forcing mode
+        (empty trigger_sequence).
 
         Returns:
             Config dict with trigger_sequence and forced_tokens, or None if
             required tokens are missing.
         """
-        vocab = self.vocab
-        end_id = vocab.get(self.HARMONY_END_TOKEN)
-        start_id = vocab.get(self.HARMONY_START_TOKEN)
-        channel_id = vocab.get(self.HARMONY_CHANNEL_TOKEN)
-        assistant_tokens = self._encode_tokens("assistant")
-
-        # Validate required tokens exist
-        if (
-            end_id is None
-            or start_id is None
-            or not assistant_tokens
-            or channel_id is None
-        ):
-            logger.warning(
-                "Missing Harmony special tokens in vocabulary. "
-                "HarmonyToolChoiceLogitsProcessor cannot be configured."
-            )
-            return None
-
-        # Trigger sequence: <|end|><|start|>assistant<|channel|>
-        # Note: assistant may be multiple tokens
-        trigger_sequence: list[int] = (
-            [end_id, start_id] + assistant_tokens + [channel_id]
-        )
-
         # Forced tokens: "commentary to="
         commentary_tokens = self._channel_token_ids.get("commentary")
         recipient_tokens = self._encode_tokens(self.HARMONY_RECIPIENT_PREFIX)
@@ -116,14 +93,15 @@ class OpenAIToolParser(ToolParser):
         forced_tokens: list[int] = commentary_tokens + recipient_tokens
 
         logger.debug(
-            "HarmonyToolChoiceLogitsProcessor config: "
-            "trigger_sequence=%s, forced_tokens=%s",
-            trigger_sequence,
+            "HarmonyToolChoiceLogitsProcessor config (immediate mode): "
+            "forced_tokens=%s",
             forced_tokens,
         )
 
+        # Use immediate forcing mode (empty trigger_sequence) because the
+        # prompt already ends with "<|start|>assistant<|channel|>"
         return {
-            "trigger_sequence": trigger_sequence,
+            "trigger_sequence": [],
             "forced_tokens": forced_tokens,
         }
 
@@ -132,9 +110,8 @@ class OpenAIToolParser(ToolParser):
         Adjust request for GPT-OSS tool_choice="required" support.
 
         For tool_choice="required", configures HarmonyToolChoiceLogitsProcessor
-        to force tool call generation by:
-        1. Detecting trigger sequence: <|end|><|start|>assistant<|channel|>
-        2. Forcing tokens: "commentary to="
+        to force "commentary to=" as the first tokens of generation. This works
+        because the prompt already ends with "<|start|>assistant<|channel|>".
         """
         if not request.tools:
             return request
