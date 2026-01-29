@@ -140,6 +140,14 @@ class OpenAIServingChat(OpenAIServing):
         self.tool_parser = self._get_tool_parser(
             tool_parser_name=tool_parser, enable_auto_tools=enable_auto_tools
         )
+        # Cache a single ToolParser instance for Harmony models.
+        #
+        # NOTE: ToolParser implementations may be stateful for streaming
+        # (see `ToolParser.extract_tool_calls_streaming`). We only reuse a
+        # cached instance in Harmony code paths where we do not rely on
+        # streaming parser state.
+        self._harmony_tool_parser_instance: ToolParser | None = None
+        self._harmony_tool_parser_tokenizer_id: int | None = None
         self.exclude_tools_when_tool_choice_none = exclude_tools_when_tool_choice_none
 
         self.enable_prompt_tokens_details = enable_prompt_tokens_details
@@ -172,6 +180,21 @@ class OpenAIServingChat(OpenAIServing):
         # Please use the Responses API instead.
         self.supports_code_interpreter = False
         self.python_tool = None
+
+    def _get_harmony_tool_parser(self, tokenizer: TokenizerLike) -> ToolParser:
+        """Return a cached ToolParser instance for Harmony models."""
+        if self.tool_parser is None:
+            raise ValueError("Tool parser is not configured.")
+
+        tokenizer_id = id(tokenizer)
+        if (
+            self._harmony_tool_parser_instance is None
+            or self._harmony_tool_parser_tokenizer_id != tokenizer_id
+        ):
+            self._harmony_tool_parser_instance = self.tool_parser(tokenizer)
+            self._harmony_tool_parser_tokenizer_id = tokenizer_id
+
+        return self._harmony_tool_parser_instance
 
     async def warmup(self) -> None:
         """
@@ -247,6 +270,8 @@ class OpenAIServingChat(OpenAIServing):
         try:
             renderer = self.engine_client.renderer
             tokenizer = renderer.tokenizer
+            if tokenizer is None:
+                raise ValueError("Tokenizer is required to process chat requests.")
 
             tool_parser = self.tool_parser
 
@@ -328,7 +353,9 @@ class OpenAIServingChat(OpenAIServing):
                 )
                 # Call adjust_request for tool_choice support (e.g., "required")
                 if tool_parser is not None:
-                    request = tool_parser(tokenizer).adjust_request(request=request)
+                    request = self._get_harmony_tool_parser(tokenizer).adjust_request(
+                        request=request
+                    )
         except (ValueError, TypeError, RuntimeError, jinja2.TemplateError) as e:
             logger.exception("Error in preprocessing prompt inputs")
             return self.create_error_response(e)
@@ -733,7 +760,7 @@ class OpenAIServingChat(OpenAIServing):
             return
         # Prepare the tool parser if it's needed
         try:
-            if tool_choice_auto and self.tool_parser:
+            if tool_choice_auto and self.tool_parser and not self.use_harmony:
                 if tokenizer is None:
                     raise ValueError(
                         "Tokenizer not available when `skip_tokenizer_init=True`"
@@ -1477,7 +1504,7 @@ class OpenAIServingChat(OpenAIServing):
                             "Tokenizer not available when `skip_tokenizer_init=True`"
                         )
 
-                    tool_parser = self.tool_parser(tokenizer)
+                    tool_parser = self._get_harmony_tool_parser(tokenizer)
                     # NOTE: We use token_ids for openai tool parser
                     tool_call_info = tool_parser.extract_tool_calls(
                         "",
