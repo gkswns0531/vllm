@@ -18,6 +18,9 @@ from vllm.tokenizers import TokenizerLike
 from vllm.tool_parsers.abstract_tool_parser import (
     ToolParser,
 )
+from vllm.v1.sample.logits_processor.harmony_tool_choice import (
+    HARMONY_TOOL_CHOICE_KEY,
+)
 
 logger = init_logger(__name__)
 
@@ -26,15 +29,15 @@ class OpenAIToolParser(ToolParser):
     """
     Tool parser for GPT-OSS Harmony models.
 
-    Supports tool_choice="required" by using bad_words token sequences
-    to block non-tool-call generation paths.
+    Supports tool_choice="required" by using HarmonyToolChoiceLogitsProcessor
+    to force tool call generation.
     """
 
     # Harmony special token names
     HARMONY_END_TOKEN = "<|end|>"
     HARMONY_START_TOKEN = "<|start|>"
     HARMONY_CHANNEL_TOKEN = "<|channel|>"
-    HARMONY_MESSAGE_TOKEN = "<|message|>"
+    HARMONY_RECIPIENT_PREFIX = " to="  # Recipient marker in Harmony format
 
     def __init__(self, tokenizer: TokenizerLike):
         super().__init__(tokenizer)
@@ -50,17 +53,12 @@ class OpenAIToolParser(ToolParser):
             "end": vocab.get(self.HARMONY_END_TOKEN),
             "start": vocab.get(self.HARMONY_START_TOKEN),
             "channel": vocab.get(self.HARMONY_CHANNEL_TOKEN),
-            "message": vocab.get(self.HARMONY_MESSAGE_TOKEN),
             "assistant": self._encode_single_token("assistant"),
         }
 
-    def _get_channel_token_ids(self) -> dict[str, int | list[int] | None]:
+    def _get_channel_token_ids(self) -> dict[str, list[int] | None]:
         """Get channel name token IDs."""
         return {
-            "final": self._encode_single_token("final"),
-            "analysis": self._encode_single_token("analysis"),
-            " final": self._encode_single_token(" final"),
-            " analysis": self._encode_single_token(" analysis"),
             "commentary": self._encode_tokens("commentary"),
         }
 
@@ -80,25 +78,21 @@ class OpenAIToolParser(ToolParser):
         except Exception:
             return None
 
-    def _build_bad_words_sequences(self) -> list[list[int]]:
+    def _build_harmony_tool_choice_config(self) -> dict | None:
         """
-        Build bad_words token sequences to block non-tool-call paths.
+        Build configuration for HarmonyToolChoiceLogitsProcessor.
 
-        Blocks these sequences (all share the same prefix pattern):
-        - <|end|><|start|>assistant<|channel|>final
-        - <|end|><|start|>assistant<|channel|>analysis
-        - <|end|><|start|>assistant<|channel|>commentary<|message|>
-          (commentary without recipient = preamble only, not a tool call)
+        This creates a config that forces "commentary to=" after detecting
+        the trigger sequence "<|end|><|start|>assistant<|channel|>".
 
-        This forces the model to use commentary channel with recipient (tool call).
+        Returns:
+            Config dict with trigger_sequence and forced_tokens, or None if
+            required tokens are missing.
         """
-        bad_sequences: list[list[int]] = []
-
         end_id = self._harmony_token_ids.get("end")
         start_id = self._harmony_token_ids.get("start")
         assistant_id = self._harmony_token_ids.get("assistant")
         channel_id = self._harmony_token_ids.get("channel")
-        message_id = self._harmony_token_ids.get("message")
 
         # Validate required tokens exist
         if (
@@ -109,36 +103,46 @@ class OpenAIToolParser(ToolParser):
         ):
             logger.warning(
                 "Missing Harmony special tokens in vocabulary. "
-                "tool_choice='required' may not work correctly."
+                "HarmonyToolChoiceLogitsProcessor cannot be configured."
             )
-            return []
+            return None
 
-        # Common prefix: <|end|><|start|>assistant<|channel|>
-        prefix: list[int] = [end_id, start_id, assistant_id, channel_id]
+        # Trigger sequence: <|end|><|start|>assistant<|channel|>
+        trigger_sequence: list[int] = [end_id, start_id, assistant_id, channel_id]
 
-        # Block final/analysis channels
-        for channel_key in ["final", "analysis", " final", " analysis"]:
-            channel_token = self._channel_token_ids.get(channel_key)
-            if isinstance(channel_token, int):
-                seq = prefix + [channel_token]
-                bad_sequences.append(seq)
-                logger.debug("Blocking %s channel: %s", channel_key, seq)
-
-        # Block commentary without recipient (preamble only, not a tool call)
+        # Forced tokens: "commentary to="
         commentary_tokens = self._channel_token_ids.get("commentary")
-        if isinstance(commentary_tokens, list) and message_id is not None:
-            seq = prefix + commentary_tokens + [message_id]
-            bad_sequences.append(seq)
-            logger.debug("Blocking commentary without recipient: %s", seq)
+        recipient_tokens = self._encode_tokens(self.HARMONY_RECIPIENT_PREFIX)
 
-        return bad_sequences
+        if not isinstance(commentary_tokens, list) or not recipient_tokens:
+            logger.warning(
+                "Could not encode 'commentary to=' tokens. "
+                "HarmonyToolChoiceLogitsProcessor cannot be configured."
+            )
+            return None
+
+        forced_tokens: list[int] = commentary_tokens + recipient_tokens
+
+        logger.debug(
+            "HarmonyToolChoiceLogitsProcessor config: "
+            "trigger_sequence=%s, forced_tokens=%s",
+            trigger_sequence,
+            forced_tokens,
+        )
+
+        return {
+            "trigger_sequence": trigger_sequence,
+            "forced_tokens": forced_tokens,
+        }
 
     def adjust_request(self, request: ChatCompletionRequest) -> ChatCompletionRequest:
         """
         Adjust request for GPT-OSS tool_choice="required" support.
 
-        For tool_choice="required", builds bad_words token sequences
-        and stores them on the request for later application to SamplingParams.
+        For tool_choice="required", configures HarmonyToolChoiceLogitsProcessor
+        to force tool call generation by:
+        1. Detecting trigger sequence: <|end|><|start|>assistant<|channel|>
+        2. Forcing tokens: "commentary to="
         """
         if not request.tools:
             return request
@@ -147,17 +151,17 @@ class OpenAIToolParser(ToolParser):
         if request.tool_choice != "required":
             return super().adjust_request(request)
 
-        logger.debug("GPT-OSS tool_choice=required: building bad_words sequences")
+        logger.debug("GPT-OSS tool_choice=required: configuring token forcing")
 
-        bad_sequences = self._build_bad_words_sequences()
-
-        if bad_sequences:
-            # Store as a temporary attribute on the request object
-            # This avoids misusing vllm_xargs which is meant for user input
-            request._tool_parser_bad_words_token_ids = bad_sequences  # type: ignore[attr-defined]
+        # Build HarmonyToolChoiceLogitsProcessor config
+        tool_choice_config = self._build_harmony_tool_choice_config()
+        if tool_choice_config:
+            # Store in extra_args for HarmonyToolChoiceLogitsProcessor
+            request._tool_parser_extra_args = {  # type: ignore[attr-defined]
+                HARMONY_TOOL_CHOICE_KEY: tool_choice_config
+            }
             logger.debug(
-                "Stored %d bad_words sequences for tool_choice=required",
-                len(bad_sequences),
+                "Configured HarmonyToolChoiceLogitsProcessor for tool_choice=required"
             )
 
         return request

@@ -20,6 +20,9 @@ from vllm.v1.sample.logits_processor.builtin import (
     MinTokensLogitsProcessor,
     process_dict_updates,
 )
+from vllm.v1.sample.logits_processor.harmony_tool_choice import (
+    HarmonyToolChoiceLogitsProcessor,
+)
 from vllm.v1.sample.logits_processor.interface import (
     BatchUpdate,
     LogitsProcessor,
@@ -50,6 +53,7 @@ BUILTIN_LOGITS_PROCESSORS: list[type[LogitsProcessor]] = [
     MinTokensLogitsProcessor,
     LogitBiasLogitsProcessor,
     MinPLogitsProcessor,
+    HarmonyToolChoiceLogitsProcessor,
 ]
 
 
@@ -341,6 +345,7 @@ __all__ = [
     "LogitBiasLogitsProcessor",
     "MinPLogitsProcessor",
     "MinTokensLogitsProcessor",
+    "HarmonyToolChoiceLogitsProcessor",
     "BatchUpdate",
     "BatchUpdateBuilder",
     "MoveDirectionality",

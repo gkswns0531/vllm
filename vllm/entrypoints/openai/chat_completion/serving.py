@@ -450,6 +450,18 @@ class OpenAIServingChat(OpenAIServing):
                                 tool_parser_bad_words
                             )
 
+                    # Apply tool parser extra_args
+                    # (e.g., HarmonyToolChoiceLogitsProcessor config)
+                    # Set by ToolParser.adjust_request()
+                    tool_parser_extra_args: dict | None = getattr(
+                        request, "_tool_parser_extra_args", None
+                    )
+                    if tool_parser_extra_args:
+                        if sampling_params.extra_args is None:
+                            sampling_params.extra_args = tool_parser_extra_args
+                        else:
+                            sampling_params.extra_args.update(tool_parser_extra_args)
+
                 self._log_inputs(
                     sub_request_id,
                     engine_prompt,
