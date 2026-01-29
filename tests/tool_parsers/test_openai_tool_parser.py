@@ -261,3 +261,52 @@ def test_extract_tool_calls_with_content(
     ]
     assert_tool_calls(extracted_info.tool_calls, expected_tool_calls)
     assert extracted_info.content == final_content
+
+
+class TestAdjustRequest:
+    """Tests for adjust_request method with tool_choice='required'."""
+
+    @pytest.fixture
+    def mock_request(self):
+        """Create a mock ChatCompletionRequest."""
+        from unittest.mock import MagicMock
+
+        request = MagicMock()
+        request.tools = [{"type": "function", "function": {"name": "test"}}]
+        request.tool_choice = "required"
+        return request
+
+    def test_adjust_request_no_tools(self, openai_tool_parser):
+        """When no tools, should return request unchanged."""
+        from unittest.mock import MagicMock
+
+        request = MagicMock()
+        request.tools = None
+
+        result = openai_tool_parser.adjust_request(request)
+
+        assert result is request
+        assert not hasattr(result, "_tool_parser_bad_words_token_ids")
+
+    def test_adjust_request_tool_choice_auto(self, openai_tool_parser):
+        """When tool_choice is not 'required', should use default behavior."""
+        from unittest.mock import MagicMock
+
+        request = MagicMock()
+        request.tools = [{"type": "function", "function": {"name": "test"}}]
+        request.tool_choice = "auto"
+
+        result = openai_tool_parser.adjust_request(request)
+
+        # Should not set bad_words for non-required tool_choice
+        assert not hasattr(result, "_tool_parser_bad_words_token_ids")
+
+    def test_adjust_request_tool_choice_required_without_harmony_tokens(
+        self, openai_tool_parser, mock_request
+    ):
+        """When tool_choice='required' but no Harmony tokens in vocab, should warn."""
+        # gpt2 tokenizer doesn't have Harmony tokens, so bad_words won't be set
+        result = openai_tool_parser.adjust_request(mock_request)
+
+        # Without Harmony tokens, no bad_words sequences should be built
+        assert not hasattr(result, "_tool_parser_bad_words_token_ids")

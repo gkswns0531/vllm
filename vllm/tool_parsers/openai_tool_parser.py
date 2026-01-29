@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import json
 from collections.abc import Sequence
-from typing import TYPE_CHECKING
 
 from vllm.entrypoints.openai.parser.harmony_utils import parse_output_into_messages
 from vllm.entrypoints.openai.protocol import (
@@ -13,35 +12,55 @@ from vllm.entrypoints.openai.protocol import (
     ToolCall,
 )
 from vllm.logger import init_logger
+from vllm.tokenizers import TokenizerLike
 from vllm.tool_parsers.abstract_tool_parser import (
     ToolParser,
 )
 
-if TYPE_CHECKING:
-    from vllm.tokenizers import TokenizerLike
-else:
-    TokenizerLike = object
-
 logger = init_logger(__name__)
 
 
-# GPT-OSS Harmony special token IDs
-_END_TOKEN_ID = 200007       # <|end|>
-_START_TOKEN_ID = 200006     # <|start|>
-_ASSISTANT_TOKEN_ID = 173781 # assistant
-_CHANNEL_TOKEN_ID = 200005   # <|channel|>
-_MESSAGE_TOKEN_ID = 200008   # <|message|>
-
-
 class OpenAIToolParser(ToolParser):
-    def __init__(self, tokenizer: "TokenizerLike"):
+    """
+    Tool parser for GPT-OSS Harmony models.
+
+    Supports tool_choice="required" by using bad_words token sequences
+    to block non-tool-call generation paths.
+    """
+
+    # Harmony special token names
+    HARMONY_END_TOKEN = "<|end|>"
+    HARMONY_START_TOKEN = "<|start|>"
+    HARMONY_CHANNEL_TOKEN = "<|channel|>"
+    HARMONY_MESSAGE_TOKEN = "<|message|>"
+
+    def __init__(self, tokenizer: TokenizerLike):
         super().__init__(tokenizer)
-        # Pre-compute token IDs for channel names
-        self._final_token_id = self._encode_single_token("final")
-        self._analysis_token_id = self._encode_single_token("analysis")
-        self._commentary_token_ids = self._encode_tokens("commentary")
-        self._final_token_w_space_id = self._encode_single_token(" final")
-        self._analysis_token_w_space_id = self._encode_single_token(" analysis")
+        # Cache special token IDs from vocab (dynamic lookup, not hardcoded)
+        self._harmony_token_ids = self._get_harmony_token_ids()
+        # Cache channel name token IDs
+        self._channel_token_ids = self._get_channel_token_ids()
+
+    def _get_harmony_token_ids(self) -> dict[str, int | None]:
+        """Get Harmony special token IDs from vocabulary."""
+        vocab = self.vocab
+        return {
+            "end": vocab.get(self.HARMONY_END_TOKEN),
+            "start": vocab.get(self.HARMONY_START_TOKEN),
+            "channel": vocab.get(self.HARMONY_CHANNEL_TOKEN),
+            "message": vocab.get(self.HARMONY_MESSAGE_TOKEN),
+            "assistant": self._encode_single_token("assistant"),
+        }
+
+    def _get_channel_token_ids(self) -> dict[str, int | list[int] | None]:
+        """Get channel name token IDs."""
+        return {
+            "final": self._encode_single_token("final"),
+            "analysis": self._encode_single_token("analysis"),
+            " final": self._encode_single_token(" final"),
+            " analysis": self._encode_single_token(" analysis"),
+            "commentary": self._encode_tokens("commentary"),
+        }
 
     def _encode_single_token(self, text: str) -> int | None:
         """Encode text and return token ID if it's a single token."""
@@ -59,21 +78,69 @@ class OpenAIToolParser(ToolParser):
         except Exception:
             return None
 
+    def _build_bad_words_sequences(self) -> list[list[int]]:
+        """
+        Build bad_words token sequences to block non-tool-call paths.
+
+        Blocks:
+        - <|end|><|start|>assistant<|channel|>final (direct final response)
+        - <|end|><|start|>assistant<|channel|>analysis (new analysis message)
+        - commentary<|message|> (commentary without recipient = not a tool call)
+
+        This allows first message to use analysis channel for reasoning,
+        but forces subsequent messages to use commentary with recipient (tool call).
+        """
+        bad_sequences: list[list[int]] = []
+
+        end_id = self._harmony_token_ids.get("end")
+        start_id = self._harmony_token_ids.get("start")
+        assistant_id = self._harmony_token_ids.get("assistant")
+        channel_id = self._harmony_token_ids.get("channel")
+        message_id = self._harmony_token_ids.get("message")
+
+        # Validate required tokens exist
+        if (
+            end_id is None
+            or start_id is None
+            or assistant_id is None
+            or channel_id is None
+        ):
+            logger.warning(
+                "Missing Harmony special tokens in vocabulary. "
+                "tool_choice='required' may not work correctly."
+            )
+            return []
+
+        # Common prefix for new assistant message (all validated as int above)
+        new_msg_prefix: list[int] = [end_id, start_id, assistant_id, channel_id]
+
+        # Block transitions to final/analysis channels
+        for channel_key in ["final", "analysis", " final", " analysis"]:
+            channel_token = self._channel_token_ids.get(channel_key)
+            if isinstance(channel_token, int):
+                seq = new_msg_prefix + [channel_token]
+                bad_sequences.append(seq)
+                logger.debug(
+                    "Blocking new message to %s channel: %s", channel_key, seq
+                )
+
+        # Block commentary without recipient (not a tool call)
+        commentary_tokens = self._channel_token_ids.get("commentary")
+        if isinstance(commentary_tokens, list) and message_id is not None:
+            seq = commentary_tokens + [message_id]
+            bad_sequences.append(seq)
+            logger.debug("Blocking commentary without recipient: %s", seq)
+
+        return bad_sequences
+
     def adjust_request(
         self, request: ChatCompletionRequest
     ) -> ChatCompletionRequest:
         """
-        Override adjust_request for GPT-OSS tool_choice="required".
+        Adjust request for GPT-OSS tool_choice="required" support.
 
-        Use bad_words token sequences to block non-tool-call paths:
-        - Block <|end|><|start|>assistant<|channel|>final (new message to final)
-        - Block <|end|><|start|>assistant<|channel|>analysis (new message to analysis)
-        - Block <|end|><|start|>assistant<|channel|> final (new message to final with space)
-        - Block <|end|><|start|>assistant<|channel|> analysis (new message to analysis with space)
-        - Block commentary<|message|> (commentary without recipient)
-
-        This allows first message to use analysis channel for reasoning,
-        but forces subsequent messages to use commentary with recipient (tool call).
+        For tool_choice="required", builds bad_words token sequences
+        and stores them on the request for later application to SamplingParams.
         """
         if not request.tools:
             return request
@@ -82,57 +149,17 @@ class OpenAIToolParser(ToolParser):
         if request.tool_choice != "required":
             return super().adjust_request(request)
 
-        # For tool_choice="required", use bad_words approach
-        logger.debug("GPT-OSS tool_choice=required: using bad_words approach")
+        logger.debug("GPT-OSS tool_choice=required: building bad_words sequences")
 
-        # Build bad_words token sequences
-        bad_sequences: list[list[int]] = []
+        bad_sequences = self._build_bad_words_sequences()
 
-        # Common prefix for new assistant message
-        new_msg_prefix = [
-            _END_TOKEN_ID,      # <|end|>
-            _START_TOKEN_ID,    # <|start|>
-            _ASSISTANT_TOKEN_ID,  # assistant
-            _CHANNEL_TOKEN_ID,  # <|channel|>
-        ]
-
-        # Block <|end|><|start|>assistant<|channel|>final
-        if self._final_token_id is not None:
-            seq = new_msg_prefix + [self._final_token_id]
-            bad_sequences.append(seq)
-            logger.debug(f"Blocking new message to final: {seq}")
-
-        # Block <|end|><|start|>assistant<|channel|>analysis
-        if self._analysis_token_id is not None:
-            seq = new_msg_prefix + [self._analysis_token_id]
-            bad_sequences.append(seq)
-            logger.debug(f"Blocking new message to analysis: {seq}")
-
-        # Block <|end|><|start|>assistant<|channel|> final
-        if self._final_token_w_space_id is not None:
-            seq = new_msg_prefix + [self._final_token_w_space_id]
-            bad_sequences.append(seq)
-            logger.debug(f"Blocking new message to final with space: {seq}")
-
-        # Block <|end|><|start|>assistant<|channel|> analysis
-        if self._analysis_token_w_space_id is not None:
-            seq = new_msg_prefix + [self._analysis_token_w_space_id]
-            bad_sequences.append(seq)
-            logger.debug(f"Blocking new message to analysis with space: {seq}")
-
-        # Block commentary<|message|> (without recipient)
-        if self._commentary_token_ids is not None:
-            seq = self._commentary_token_ids + [_MESSAGE_TOKEN_ID]
-            bad_sequences.append(seq)
-            logger.debug(f"Blocking commentary without recipient: {seq}")
-
-        # Store in vllm_xargs for later application to SamplingParams
         if bad_sequences:
-            if request.vllm_xargs is None:
-                request.vllm_xargs = {}
-            request.vllm_xargs["_gptoss_bad_words_token_ids"] = bad_sequences
+            # Store as a temporary attribute on the request object
+            # This avoids misusing vllm_xargs which is meant for user input
+            request._tool_parser_bad_words_token_ids = bad_sequences  # type: ignore[attr-defined]
             logger.debug(
-                f"Stored {len(bad_sequences)} bad_words sequences in vllm_xargs"
+                "Stored %d bad_words sequences for tool_choice=required",
+                len(bad_sequences),
             )
 
         return request
@@ -145,7 +172,8 @@ class OpenAIToolParser(ToolParser):
     ) -> ExtractedToolCallInformation:
         if token_ids is None:
             raise NotImplementedError(
-                "OpenAIToolParser requires token IDs and does not support text-based extraction."  # noqa: E501
+                "OpenAIToolParser requires token IDs and does not support "
+                "text-based extraction."
             )
 
         parser = parse_output_into_messages(token_ids)
@@ -187,12 +215,13 @@ class OpenAIToolParser(ToolParser):
                 elif msg.channel == "commentary" and not msg.recipient:
                     commentary_content = msg_text
 
-        # Extract partial content from the parser state if the generation was truncated
+        # Extract partial content from the parser state if generation was truncated
         if parser.current_content:
             if parser.current_channel == "final":
                 final_content = parser.current_content
             elif (
-                parser.current_channel == "commentary" and not parser.current_recipient
+                parser.current_channel == "commentary"
+                and not parser.current_recipient
             ):
                 commentary_content = parser.current_content
 
@@ -215,6 +244,5 @@ class OpenAIToolParser(ToolParser):
         request: ChatCompletionRequest,
     ) -> DeltaMessage | None:
         raise NotImplementedError(
-            "Not being used, manual parsing in serving_chat.py"  # noqa: E501
+            "Not being used, manual parsing in serving_chat.py"
         )
-    
