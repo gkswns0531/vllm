@@ -41,20 +41,8 @@ class OpenAIToolParser(ToolParser):
 
     def __init__(self, tokenizer: TokenizerLike):
         super().__init__(tokenizer)
-        # Cache special token IDs from vocab (dynamic lookup, not hardcoded)
-        self._harmony_token_ids = self._get_harmony_token_ids()
         # Cache channel name token IDs
         self._channel_token_ids = self._get_channel_token_ids()
-
-    def _get_harmony_token_ids(self) -> dict[str, int | None]:
-        """Get Harmony special token IDs from vocabulary."""
-        vocab = self.vocab
-        return {
-            "end": vocab.get(self.HARMONY_END_TOKEN),
-            "start": vocab.get(self.HARMONY_START_TOKEN),
-            "channel": vocab.get(self.HARMONY_CHANNEL_TOKEN),
-            "assistant": self._encode_single_token("assistant"),
-        }
 
     def _get_channel_token_ids(self) -> dict[str, list[int] | None]:
         """Get channel name token IDs."""
@@ -89,16 +77,17 @@ class OpenAIToolParser(ToolParser):
             Config dict with trigger_sequence and forced_tokens, or None if
             required tokens are missing.
         """
-        end_id = self._harmony_token_ids.get("end")
-        start_id = self._harmony_token_ids.get("start")
-        assistant_id = self._harmony_token_ids.get("assistant")
-        channel_id = self._harmony_token_ids.get("channel")
+        vocab = self.vocab
+        end_id = vocab.get(self.HARMONY_END_TOKEN)
+        start_id = vocab.get(self.HARMONY_START_TOKEN)
+        channel_id = vocab.get(self.HARMONY_CHANNEL_TOKEN)
+        assistant_tokens = self._encode_tokens("assistant")
 
         # Validate required tokens exist
         if (
             end_id is None
             or start_id is None
-            or assistant_id is None
+            or not assistant_tokens
             or channel_id is None
         ):
             logger.warning(
@@ -108,7 +97,10 @@ class OpenAIToolParser(ToolParser):
             return None
 
         # Trigger sequence: <|end|><|start|>assistant<|channel|>
-        trigger_sequence: list[int] = [end_id, start_id, assistant_id, channel_id]
+        # Note: assistant may be multiple tokens
+        trigger_sequence: list[int] = (
+            [end_id, start_id] + assistant_tokens + [channel_id]
+        )
 
         # Forced tokens: "commentary to="
         commentary_tokens = self._channel_token_ids.get("commentary")
