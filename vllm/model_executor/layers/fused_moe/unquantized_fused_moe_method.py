@@ -204,6 +204,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             moe_config=self.moe,
         )
 
+        if self.unquantized_backend == UnquantizedMoeBackend.FLASHINFER_CUTLASS:
+            self.moe_mk = self.kernel
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         super().process_weights_after_loading(layer)
 

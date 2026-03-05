@@ -10,6 +10,9 @@ import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe.all2all_utils import (
+    maybe_make_prepare_finalize,
+)
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
     FusedMoEQuantConfig,
@@ -66,7 +69,6 @@ def select_unquantized_moe_backend(
         has_flashinfer_cutlass_fused_moe()
         and envs.VLLM_USE_FLASHINFER_MOE_FP16
         and use_ep
-        and (not use_dp)
         and current_platform.get_device_capability()[0] >= 9
     )
     if current_platform.is_rocm():
@@ -78,16 +80,11 @@ def select_unquantized_moe_backend(
         if flashinfer_cutlass_moe_enabled:
             backend = UnquantizedMoeBackend.FLASHINFER_CUTLASS
         else:
-            if use_ep and (not use_dp):
+            if use_ep:
                 logger.info_once(
                     "FlashInfer CUTLASS MoE is available for EP"
                     " but not enabled, consider setting"
                     " VLLM_USE_FLASHINFER_MOE_FP16=1 to enable it.",
-                    scope="local",
-                )
-            elif use_dp:
-                logger.info_once(
-                    "FlashInfer CUTLASS MoE is currently not available for DP.",
                     scope="local",
                 )
             backend = UnquantizedMoeBackend.TRITON
@@ -137,12 +134,20 @@ def make_unquantized_moe_kernel(
             FlashInferExperts,
         )
 
+        prepare_finalize = maybe_make_prepare_finalize(
+            moe=moe_config,
+            quant_config=quant_config,
+            allow_new_interface=True,
+        )
+        assert prepare_finalize is not None
+        logger.info_once("Using %s", prepare_finalize.__class__.__name__)
         kernel = mk.FusedMoEModularKernel(
-            MoEPrepareAndFinalizeNoEP(),
+            prepare_finalize,
             FlashInferExperts(
                 moe_config=moe_config,
                 quant_config=quant_config,
             ),
+            moe_parallel_config=moe_config.moe_parallel_config,
         )
         use_inplace = False
     elif backend == UnquantizedMoeBackend.AITER:
