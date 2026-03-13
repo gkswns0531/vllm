@@ -337,7 +337,7 @@ def parse_output_into_messages(token_ids: Iterable[int]) -> StreamableParser:
     for token_id in token_ids:
         try:
             parser.process(token_id)
-        except Exception:
+        except (ValueError, RuntimeError):
             # Grammar-constrained output (e.g. tool_choice=required EBNF)
             # may produce token sequences that the Harmony parser cannot
             # fully handle (e.g. <|call|> after <|end|>).  Return the

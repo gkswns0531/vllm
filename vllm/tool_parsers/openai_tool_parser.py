@@ -66,6 +66,11 @@ class OpenAIToolParser(ToolParser):
         Content rule uses ([^<] | "<" [^|])* to allow '<' in text
         while blocking Harmony special tokens (<|...|>).
         """
+        for n in tool_names:
+            if '"' in n or "\n" in n:
+                raise ValueError(
+                    f"Tool name {n!r} contains characters invalid for EBNF grammar"
+                )
         func_alts = " | ".join(f'"functions.{n}"' for n in tool_names)
         return (
             "root ::= non_tool_block* tool_block more_tool*\n"

@@ -92,6 +92,22 @@ def test_build_grammar_tool_names_with_numbers_underscores(
     assert '"functions.search_123"' in grammar
 
 
+def test_build_grammar_rejects_tool_name_with_quotes(
+    parser: OpenAIToolParser,
+) -> None:
+    """Tool names containing quotes must be rejected to prevent grammar injection."""
+    with pytest.raises(ValueError, match="invalid for EBNF grammar"):
+        parser._build_tool_required_grammar(['get"weather'])
+
+
+def test_build_grammar_rejects_tool_name_with_newlines(
+    parser: OpenAIToolParser,
+) -> None:
+    """Tool names containing newlines must be rejected."""
+    with pytest.raises(ValueError, match="invalid for EBNF grammar"):
+        parser._build_tool_required_grammar(["get\nweather"])
+
+
 # ---------------------------------------------------------------------------
 # adjust_request tests
 # ---------------------------------------------------------------------------
