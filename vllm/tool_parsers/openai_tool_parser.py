@@ -47,10 +47,6 @@ class OpenAIToolParser(ToolParser):
         grammar = self._build_tool_required_grammar(tool_names)
         request.structured_outputs = StructuredOutputsParams(grammar=grammar)
         request.response_format = None
-        logger.debug(
-            "GPT-OSS tool_choice=required: using EBNF grammar with %d tools",
-            len(tool_names),
-        )
         return request
 
     @staticmethod
