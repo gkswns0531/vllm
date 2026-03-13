@@ -106,10 +106,13 @@ class OpenAIToolParser(ToolParser):
                     # most common case with gpt-oss models.
                     if not msg.content_type or "json" in msg.content_type:
                         # load and dump the JSON text to check validity and
-                        # remove any extra newlines or other odd formatting
+                        # remove any extra newlines or other odd formatting.
+                        # Use raw_decode to handle trailing garbage from
+                        # partial Harmony parsing (e.g. structural tokens).
                         try:
-                            tool_args = json.dumps(json.loads(msg_text))
-                        except json.JSONDecodeError:
+                            obj, _ = json.JSONDecoder().raw_decode(msg_text)
+                            tool_args = json.dumps(obj)
+                        except (json.JSONDecodeError, ValueError):
                             logger.exception(
                                 "Error decoding JSON tool call from response."
                             )

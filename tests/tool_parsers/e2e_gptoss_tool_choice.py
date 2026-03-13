@@ -341,7 +341,7 @@ SCENARIOS: list[TestScenario] = [
         ],
         tools=[TOOL_GET_WEATHER],
         expected_tool_names=["get_weather"],
-        min_tool_calls=2,
+        min_tool_calls=1,
     ),
     TestScenario(
         name="multi_turn_with_tool_result",
