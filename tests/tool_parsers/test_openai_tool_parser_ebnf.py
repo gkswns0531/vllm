@@ -1302,3 +1302,253 @@ class TestXgrammarContentEdgeCases:
             V["<|call|>"],
         ]
         assert _compile_and_run(xgr_compiler, ["search"], seq)
+
+
+# ---------------------------------------------------------------------------
+# Production gap tests — final sweep
+# ---------------------------------------------------------------------------
+
+
+class TestXgrammarEOSMidSequence:
+    """Verify EOS is blocked at every critical mid-sequence point."""
+
+    def test_eos_blocked_mid_tool_arguments(self, xgr_compiler) -> None:
+        """EOS must be blocked while model is generating tool arguments."""
+        grammar = OpenAIToolParser._build_tool_required_grammar(["get_weather"])
+        ctx = xgr_compiler.compile_grammar(grammar)
+        matcher = xgrammar.GrammarMatcher(ctx)
+        # Start tool call, get into content position
+        seq = [
+            V["commentary"],
+            V[" to="],
+            V["functions."],
+            V["get_weather"],
+            V["<|message|>"],
+            V["{"],
+        ]
+        for tid in seq:
+            assert matcher.accept_token(tid)
+        bitmask = xgrammar.allocate_token_bitmask(1, len(VOCAB))
+        matcher.fill_next_token_bitmask(bitmask, 0)
+        assert not _bitmask_allowed(bitmask, V["<|eos|>"]), (
+            "EOS must be blocked mid-tool-arguments"
+        )
+
+    def test_eos_blocked_after_multiple_analysis_rounds(self, xgr_compiler) -> None:
+        """EOS stays blocked even after many analysis rounds (no tool)."""
+        grammar = OpenAIToolParser._build_tool_required_grammar(["get_weather"])
+        ctx = xgr_compiler.compile_grammar(grammar)
+        matcher = xgrammar.GrammarMatcher(ctx)
+        # 3 rounds of analysis, no tool call
+        for _ in range(3):
+            for tid in [
+                V["analysis"],
+                V["<|message|>"],
+                V["hello"],
+                V["<|end|>"],
+                V["<|start|>"],
+                V["assistant"],
+                V["<|channel|>"],
+            ]:
+                assert matcher.accept_token(tid)
+        bitmask = xgrammar.allocate_token_bitmask(1, len(VOCAB))
+        matcher.fill_next_token_bitmask(bitmask, 0)
+        assert not _bitmask_allowed(bitmask, V["<|eos|>"]), (
+            "EOS must stay blocked without any tool call"
+        )
+
+
+class TestXgrammarMoreToolVariations:
+    """Test more_tool paths not yet covered."""
+
+    def test_commentary_preamble_between_tool_calls(self, xgr_compiler) -> None:
+        """Commentary preamble (not analysis) between two tool calls."""
+        seq = [
+            # tool call 1
+            V["commentary"],
+            V[" to="],
+            V["functions."],
+            V["get_weather"],
+            V["<|message|>"],
+            V["{"],
+            V["}"],
+            V["<|end|>"],
+            V["<|call|>"],
+            # commentary preamble between tools
+            V["<|start|>"],
+            V["assistant"],
+            V["<|channel|>"],
+            V["commentary"],
+            V["<|message|>"],
+            V["Let me"],
+            V[" call"],
+            V[" tools"],
+            V["<|end|>"],
+            V["<|start|>"],
+            V["assistant"],
+            V["<|channel|>"],
+            # tool call 2
+            V["commentary"],
+            V[" to="],
+            V["functions."],
+            V["search"],
+            V["<|message|>"],
+            V["{"],
+            V["}"],
+            V["<|end|>"],
+            V["<|call|>"],
+        ]
+        assert _compile_and_run(xgr_compiler, ["get_weather", "search"], seq)
+
+    def test_three_consecutive_tool_calls(self, xgr_compiler) -> None:
+        """Three tool calls in sequence (more_tool* with count=2)."""
+        tool_names = ["get_weather", "search", "calculate"]
+        parts: list[int] = []
+        for i, name in enumerate(tool_names):
+            if i > 0:
+                parts.extend(
+                    [
+                        V["<|start|>"],
+                        V["assistant"],
+                        V["<|channel|>"],
+                    ]
+                )
+            parts.extend(
+                [
+                    V["commentary"],
+                    V[" to="],
+                    V["functions."],
+                    V[name],
+                    V["<|message|>"],
+                    V["{"],
+                    V["}"],
+                    V["<|end|>"],
+                    V["<|call|>"],
+                ]
+            )
+        assert _compile_and_run(xgr_compiler, tool_names, parts)
+
+
+class TestXgrammarContentAmbiguity:
+    """Verify grammar keywords are treated as plain text inside content."""
+
+    def test_channel_names_in_content(self, xgr_compiler) -> None:
+        """'analysis' and 'commentary' tokens in content are text."""
+        seq = [
+            V["analysis"],
+            V["<|message|>"],
+            # content contains "analysis"/"commentary" as plain text
+            V["analysis"],
+            V["commentary"],
+            V["hello"],
+            V["<|end|>"],
+            V["<|start|>"],
+            V["assistant"],
+            V["<|channel|>"],
+            V["commentary"],
+            V[" to="],
+            V["functions."],
+            V["get_weather"],
+            V["<|message|>"],
+            V["{"],
+            V["}"],
+            V["<|end|>"],
+            V["<|call|>"],
+        ]
+        assert _compile_and_run(xgr_compiler, ["get_weather"], seq)
+
+    def test_to_equals_token_in_content(self, xgr_compiler) -> None:
+        """' to=' token inside content (after <|message|>) is text."""
+        seq = [
+            V["analysis"],
+            V["<|message|>"],
+            V["hello"],
+            V[" to="],  # plain text, not routing syntax
+            V["world"],
+            V["<|end|>"],
+            V["<|start|>"],
+            V["assistant"],
+            V["<|channel|>"],
+            V["commentary"],
+            V[" to="],
+            V["functions."],
+            V["get_weather"],
+            V["<|message|>"],
+            V["{"],
+            V["}"],
+            V["<|end|>"],
+            V["<|call|>"],
+        ]
+        assert _compile_and_run(xgr_compiler, ["get_weather"], seq)
+
+    def test_functions_dot_in_content(self, xgr_compiler) -> None:
+        """'functions.' token inside content is plain text."""
+        seq = [
+            V["analysis"],
+            V["<|message|>"],
+            V["hello"],
+            V["functions."],
+            V["world"],
+            V["<|end|>"],
+            V["<|start|>"],
+            V["assistant"],
+            V["<|channel|>"],
+            V["commentary"],
+            V[" to="],
+            V["functions."],
+            V["search"],
+            V["<|message|>"],
+            V["{"],
+            V["}"],
+            V["<|end|>"],
+            V["<|call|>"],
+        ]
+        assert _compile_and_run(xgr_compiler, ["search"], seq)
+
+    def test_assistant_token_in_content(self, xgr_compiler) -> None:
+        """'assistant' token inside content is plain text."""
+        seq = [
+            V["analysis"],
+            V["<|message|>"],
+            V["assistant"],
+            V["hello"],
+            V["<|end|>"],
+            V["<|start|>"],
+            V["assistant"],
+            V["<|channel|>"],
+            V["commentary"],
+            V[" to="],
+            V["functions."],
+            V["get_weather"],
+            V["<|message|>"],
+            V["{"],
+            V["}"],
+            V["<|end|>"],
+            V["<|call|>"],
+        ]
+        assert _compile_and_run(xgr_compiler, ["get_weather"], seq)
+
+
+class TestXgrammarPositionalBitmask:
+    """Verify bitmask constraints at specific grammar positions."""
+
+    def test_after_func_name_only_message_allowed(self, xgr_compiler) -> None:
+        """After func_name, only '<|message|>' should be allowed."""
+        grammar = OpenAIToolParser._build_tool_required_grammar(["get_weather"])
+        ctx = xgr_compiler.compile_grammar(grammar)
+        matcher = xgrammar.GrammarMatcher(ctx)
+        for tid in [
+            V["commentary"],
+            V[" to="],
+            V["functions."],
+            V["get_weather"],
+        ]:
+            assert matcher.accept_token(tid)
+
+        bitmask = xgrammar.allocate_token_bitmask(1, len(VOCAB))
+        matcher.fill_next_token_bitmask(bitmask, 0)
+        assert _bitmask_allowed(bitmask, V["<|message|>"])
+        assert not _bitmask_allowed(bitmask, V["<|end|>"])
+        assert not _bitmask_allowed(bitmask, V["<|call|>"])
+        assert not _bitmask_allowed(bitmask, V["hello"])
+        assert not _bitmask_allowed(bitmask, V["<|eos|>"])
