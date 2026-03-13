@@ -75,6 +75,23 @@ def test_build_grammar_no_final_channel(parser: OpenAIToolParser) -> None:
     assert "<|return|>" not in grammar
 
 
+def test_build_grammar_many_tools(parser: OpenAIToolParser) -> None:
+    """Grammar with 20 tools should contain all alternatives."""
+    tools = [f"tool_{i}" for i in range(20)]
+    grammar = parser._build_tool_required_grammar(tools)
+    for name in tools:
+        assert f'"functions.{name}"' in grammar
+
+
+def test_build_grammar_tool_names_with_numbers_underscores(
+    parser: OpenAIToolParser,
+) -> None:
+    """Tool names with numbers and underscores are preserved."""
+    grammar = parser._build_tool_required_grammar(["get_weather_v2", "search_123"])
+    assert '"functions.get_weather_v2"' in grammar
+    assert '"functions.search_123"' in grammar
+
+
 # ---------------------------------------------------------------------------
 # adjust_request tests
 # ---------------------------------------------------------------------------
@@ -133,6 +150,31 @@ def test_adjust_request_no_tools_unchanged(parser: OpenAIToolParser) -> None:
     assert result.structured_outputs is None
 
 
+def test_adjust_request_tool_choice_none(parser: OpenAIToolParser) -> None:
+    """tool_choice='none' should not activate grammar."""
+    request = ChatCompletionRequest(
+        model="test",
+        messages=[{"role": "user", "content": "hi"}],
+        tools=_make_tools("f"),
+        tool_choice="none",
+    )
+    result = parser.adjust_request(request)
+    assert result.structured_outputs is None
+
+
+def test_adjust_request_with_tools_default_choice(
+    parser: OpenAIToolParser,
+) -> None:
+    """tools present but tool_choice not set should not activate grammar."""
+    request = ChatCompletionRequest(
+        model="test",
+        messages=[{"role": "user", "content": "hi"}],
+        tools=_make_tools("get_weather"),
+    )
+    result = parser.adjust_request(request)
+    assert result.structured_outputs is None
+
+
 # ---------------------------------------------------------------------------
 # xgrammar validation tests (require xgrammar installed)
 # ---------------------------------------------------------------------------
@@ -183,6 +225,11 @@ def _make_test_vocab() -> list[str]:
         "b",  # 37
         ",",  # 38
         " and",  # 39
+        "\n",  # 40 — newline
+        "[",  # 41
+        "]",  # 42
+        "search_web",  # 43 — prefix edge case
+        " finally",  # 44 — must be blocked at channel position
     ]
 
 
@@ -230,6 +277,13 @@ def _compile_and_check_blocked(
 
 VOCAB = _make_test_vocab()
 V = {s: i for i, s in enumerate(VOCAB)}
+
+
+def _bitmask_allowed(bitmask, token_id: int) -> bool:
+    """Check if a token is allowed by the xgrammar bitmask."""
+    byte_idx = token_id // 32
+    bit_idx = token_id % 32
+    return bool(bitmask[0, byte_idx].item() & (1 << bit_idx))
 
 
 class TestXgrammarAcceptance:
@@ -582,3 +636,669 @@ class TestXgrammarBitmask:
         assert is_allowed(V["commentary"]), "commentary should be allowed"
         assert not is_allowed(V["final"]), "final should be blocked"
         assert not is_allowed(V["<|return|>"]), "<|return|> should be blocked"
+
+
+# ---------------------------------------------------------------------------
+# Termination & EOS tests — critical for production decoding
+# ---------------------------------------------------------------------------
+
+
+class TestXgrammarTermination:
+    """Verify grammar terminates at correct points.
+
+    In production, xgrammar blocks EOS until the grammar is satisfied.
+    If termination is wrong, the model either hangs (never EOS) or
+    stops prematurely (EOS before tool call).
+    """
+
+    def test_satisfied_after_single_tool_call(self, xgr_compiler) -> None:
+        """After one tool_block, EOS is allowed and more tools can start.
+
+        Note: is_terminated() is False because more_tool* can accept more.
+        The correct production check is that EOS is allowed in bitmask.
+        """
+        grammar = OpenAIToolParser._build_tool_required_grammar(["get_weather"])
+        ctx = xgr_compiler.compile_grammar(grammar)
+        matcher = xgrammar.GrammarMatcher(ctx)
+        seq = [
+            V["commentary"],
+            V[" to="],
+            V["functions."],
+            V["get_weather"],
+            V["<|message|>"],
+            V["{"],
+            V["}"],
+            V["<|end|>"],
+            V["<|call|>"],
+        ]
+        for tid in seq:
+            assert matcher.accept_token(tid)
+        # Grammar is NOT terminated (more_tool* can match)
+        assert not matcher.is_terminated()
+        # But EOS IS allowed — grammar is satisfied
+        bitmask = xgrammar.allocate_token_bitmask(1, len(VOCAB))
+        matcher.fill_next_token_bitmask(bitmask, 0)
+        assert _bitmask_allowed(bitmask, V["<|eos|>"]), (
+            "EOS must be allowed after complete tool call"
+        )
+        # More tool calls can also start
+        assert _bitmask_allowed(bitmask, V["<|start|>"]), (
+            "more_tool path must remain open"
+        )
+
+    def test_satisfied_after_multi_tool_calls(self, xgr_compiler) -> None:
+        """After tool_block + more_tool, EOS is allowed."""
+        grammar = OpenAIToolParser._build_tool_required_grammar(
+            ["get_weather", "search"]
+        )
+        ctx = xgr_compiler.compile_grammar(grammar)
+        matcher = xgrammar.GrammarMatcher(ctx)
+        seq = [
+            # tool 1
+            V["commentary"],
+            V[" to="],
+            V["functions."],
+            V["get_weather"],
+            V["<|message|>"],
+            V["{"],
+            V["}"],
+            V["<|end|>"],
+            V["<|call|>"],
+            # tool 2
+            V["<|start|>"],
+            V["assistant"],
+            V["<|channel|>"],
+            V["commentary"],
+            V[" to="],
+            V["functions."],
+            V["search"],
+            V["<|message|>"],
+            V["{"],
+            V["}"],
+            V["<|end|>"],
+            V["<|call|>"],
+        ]
+        for tid in seq:
+            assert matcher.accept_token(tid)
+        bitmask = xgrammar.allocate_token_bitmask(1, len(VOCAB))
+        matcher.fill_next_token_bitmask(bitmask, 0)
+        assert _bitmask_allowed(bitmask, V["<|eos|>"]), (
+            "EOS must be allowed after multiple tool calls"
+        )
+
+    def test_not_terminated_mid_tool_call(self, xgr_compiler) -> None:
+        """Not terminated when <|call|> has not been emitted yet."""
+        grammar = OpenAIToolParser._build_tool_required_grammar(["get_weather"])
+        ctx = xgr_compiler.compile_grammar(grammar)
+        matcher = xgrammar.GrammarMatcher(ctx)
+        seq = [
+            V["commentary"],
+            V[" to="],
+            V["functions."],
+            V["get_weather"],
+            V["<|message|>"],
+            V["{"],
+            V["}"],
+            V["<|end|>"],
+            # missing <|call|>
+        ]
+        for tid in seq:
+            assert matcher.accept_token(tid)
+        assert not matcher.is_terminated()
+
+    def test_eos_blocked_before_any_tool_call(self, xgr_compiler) -> None:
+        """EOS must be blocked in bitmask when no tool call has been made."""
+        grammar = OpenAIToolParser._build_tool_required_grammar(["get_weather"])
+        ctx = xgr_compiler.compile_grammar(grammar)
+        matcher = xgrammar.GrammarMatcher(ctx)
+        seq = [
+            V["analysis"],
+            V["<|message|>"],
+            V["hello"],
+            V["<|end|>"],
+        ]
+        for tid in seq:
+            assert matcher.accept_token(tid)
+        bitmask = xgrammar.allocate_token_bitmask(1, len(VOCAB))
+        matcher.fill_next_token_bitmask(bitmask, 0)
+        assert not _bitmask_allowed(bitmask, V["<|eos|>"]), (
+            "EOS must be blocked before tool call"
+        )
+
+    def test_eos_allowed_after_complete_tool_call(self, xgr_compiler) -> None:
+        """EOS must be allowed in bitmask after grammar is satisfied."""
+        grammar = OpenAIToolParser._build_tool_required_grammar(["get_weather"])
+        ctx = xgr_compiler.compile_grammar(grammar)
+        matcher = xgrammar.GrammarMatcher(ctx)
+        seq = [
+            V["commentary"],
+            V[" to="],
+            V["functions."],
+            V["get_weather"],
+            V["<|message|>"],
+            V["{"],
+            V["}"],
+            V["<|end|>"],
+            V["<|call|>"],
+        ]
+        for tid in seq:
+            assert matcher.accept_token(tid)
+        bitmask = xgrammar.allocate_token_bitmask(1, len(VOCAB))
+        matcher.fill_next_token_bitmask(bitmask, 0)
+        assert _bitmask_allowed(bitmask, V["<|eos|>"]), (
+            "EOS must be allowed after tool call"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Empty content tests
+# ---------------------------------------------------------------------------
+
+
+class TestXgrammarEmptyContent:
+    """Test empty content in various block types.
+
+    Models sometimes produce empty analysis or empty tool arguments.
+    The content rule uses *, so zero-length content must be valid.
+    """
+
+    def test_empty_tool_call_arguments(self, xgr_compiler) -> None:
+        """Tool call with nothing between <|message|> and <|end|>."""
+        seq = [
+            V["commentary"],
+            V[" to="],
+            V["functions."],
+            V["get_weather"],
+            V["<|message|>"],
+            V["<|end|>"],
+            V["<|call|>"],
+        ]
+        assert _compile_and_run(xgr_compiler, ["get_weather"], seq)
+
+    def test_empty_analysis_content(self, xgr_compiler) -> None:
+        """Analysis block with empty message body."""
+        seq = [
+            V["analysis"],
+            V["<|message|>"],
+            V["<|end|>"],
+            V["<|start|>"],
+            V["assistant"],
+            V["<|channel|>"],
+            V["commentary"],
+            V[" to="],
+            V["functions."],
+            V["get_weather"],
+            V["<|message|>"],
+            V["{"],
+            V["}"],
+            V["<|end|>"],
+            V["<|call|>"],
+        ]
+        assert _compile_and_run(xgr_compiler, ["get_weather"], seq)
+
+    def test_empty_preamble_content(self, xgr_compiler) -> None:
+        """Commentary preamble with empty message body."""
+        seq = [
+            V["commentary"],
+            V["<|message|>"],
+            V["<|end|>"],
+            V["<|start|>"],
+            V["assistant"],
+            V["<|channel|>"],
+            V["commentary"],
+            V[" to="],
+            V["functions."],
+            V["get_weather"],
+            V["<|message|>"],
+            V["{"],
+            V["}"],
+            V["<|end|>"],
+            V["<|call|>"],
+        ]
+        assert _compile_and_run(xgr_compiler, ["get_weather"], seq)
+
+
+# ---------------------------------------------------------------------------
+# Commentary disambiguation — CRITICAL for production
+# ---------------------------------------------------------------------------
+
+
+class TestXgrammarCommentaryDisambiguation:
+    """Verify 'commentary' correctly branches to preamble vs tool call.
+
+    The grammar has an ambiguity at 'commentary':
+    - non_tool_block: 'commentary' followed by '<|message|>'
+    - tool_block: 'commentary to=' followed by func_name
+
+    xgrammar must keep both paths open until the next token resolves it.
+    If this fails, the model either can't make preambles or can't make
+    tool calls — catastrophic in production.
+    """
+
+    def test_after_commentary_both_paths_available(self, xgr_compiler) -> None:
+        """After 'commentary', both '<|message|>' and ' to=' are allowed."""
+        grammar = OpenAIToolParser._build_tool_required_grammar(["get_weather"])
+        ctx = xgr_compiler.compile_grammar(grammar)
+        matcher = xgrammar.GrammarMatcher(ctx)
+        assert matcher.accept_token(V["commentary"])
+
+        bitmask = xgrammar.allocate_token_bitmask(1, len(VOCAB))
+        matcher.fill_next_token_bitmask(bitmask, 0)
+        assert _bitmask_allowed(bitmask, V["<|message|>"]), "preamble path must be open"
+        assert _bitmask_allowed(bitmask, V[" to="]), "tool call path must be open"
+        assert not _bitmask_allowed(bitmask, V["final"])
+        assert not _bitmask_allowed(bitmask, V["hello"])
+
+    def test_disambiguation_in_more_tool(self, xgr_compiler) -> None:
+        """After first tool + <|channel|> + commentary, both paths open."""
+        grammar = OpenAIToolParser._build_tool_required_grammar(["get_weather"])
+        ctx = xgr_compiler.compile_grammar(grammar)
+        matcher = xgrammar.GrammarMatcher(ctx)
+        seq = [
+            V["commentary"],
+            V[" to="],
+            V["functions."],
+            V["get_weather"],
+            V["<|message|>"],
+            V["{"],
+            V["}"],
+            V["<|end|>"],
+            V["<|call|>"],
+            # more_tool header
+            V["<|start|>"],
+            V["assistant"],
+            V["<|channel|>"],
+            V["commentary"],
+        ]
+        for tid in seq:
+            assert matcher.accept_token(tid)
+
+        bitmask = xgrammar.allocate_token_bitmask(1, len(VOCAB))
+        matcher.fill_next_token_bitmask(bitmask, 0)
+        assert _bitmask_allowed(bitmask, V["<|message|>"]), (
+            "preamble path must be open in more_tool"
+        )
+        assert _bitmask_allowed(bitmask, V[" to="]), (
+            "tool call path must be open in more_tool"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Special tokens blocked inside content
+# ---------------------------------------------------------------------------
+
+
+class TestXgrammarContentSpecialTokens:
+    """Verify all Harmony special tokens are blocked inside content.
+
+    The content rule ([^<] | '<' [^|])* must block <|...|> tokens
+    while allowing regular '<' usage. This is the core safety
+    mechanism preventing the model from injecting channels or
+    control tokens inside message bodies.
+    """
+
+    def test_all_special_tokens_blocked_in_content(self, xgr_compiler) -> None:
+        """Every <|...|> token must be blocked inside content."""
+        grammar = OpenAIToolParser._build_tool_required_grammar(["get_weather"])
+        ctx = xgr_compiler.compile_grammar(grammar)
+        matcher = xgrammar.GrammarMatcher(ctx)
+        # Navigate to content position
+        for tid in [V["analysis"], V["<|message|>"], V["hello"]]:
+            assert matcher.accept_token(tid)
+
+        bitmask = xgrammar.allocate_token_bitmask(1, len(VOCAB))
+        matcher.fill_next_token_bitmask(bitmask, 0)
+        # All Harmony specials blocked
+        assert not _bitmask_allowed(bitmask, V["<|start|>"])
+        assert not _bitmask_allowed(bitmask, V["<|channel|>"])
+        assert not _bitmask_allowed(bitmask, V["<|call|>"])
+        assert not _bitmask_allowed(bitmask, V["<|return|>"])
+        assert not _bitmask_allowed(bitmask, V["<|message|>"])
+        # <|end|> IS allowed (it terminates content)
+        assert _bitmask_allowed(bitmask, V["<|end|>"])
+        # Regular content tokens remain allowed
+        assert _bitmask_allowed(bitmask, V["hello"])
+        assert _bitmask_allowed(bitmask, V[" < "])
+        assert _bitmask_allowed(bitmask, V["<="])
+        assert _bitmask_allowed(bitmask, V["</div>"])
+
+
+# ---------------------------------------------------------------------------
+# Tool name edge cases
+# ---------------------------------------------------------------------------
+
+
+class TestXgrammarToolNameEdgeCases:
+    """Test edge cases around tool/function names."""
+
+    def test_tool_name_prefix_of_another(self, xgr_compiler) -> None:
+        """Both 'search' and 'search_web' in grammar; call search_web."""
+        seq = [
+            V["commentary"],
+            V[" to="],
+            V["functions."],
+            V["search_web"],
+            V["<|message|>"],
+            V["{"],
+            V["}"],
+            V["<|end|>"],
+            V["<|call|>"],
+        ]
+        assert _compile_and_run(xgr_compiler, ["search", "search_web"], seq)
+
+    def test_prefix_name_also_works(self, xgr_compiler) -> None:
+        """When both 'search' and 'search_web' exist, 'search' is valid."""
+        seq = [
+            V["commentary"],
+            V[" to="],
+            V["functions."],
+            V["search"],
+            V["<|message|>"],
+            V["{"],
+            V["}"],
+            V["<|end|>"],
+            V["<|call|>"],
+        ]
+        assert _compile_and_run(xgr_compiler, ["search", "search_web"], seq)
+
+    def test_same_tool_called_twice(self, xgr_compiler) -> None:
+        """Same tool called in consecutive tool_blocks."""
+        seq = [
+            # first call
+            V["commentary"],
+            V[" to="],
+            V["functions."],
+            V["get_weather"],
+            V["<|message|>"],
+            V["{"],
+            V['"'],
+            V["location"],
+            V['"'],
+            V[":"],
+            V['"'],
+            V["Tokyo"],
+            V['"'],
+            V["}"],
+            V["<|end|>"],
+            V["<|call|>"],
+            # second call — same tool, different args
+            V["<|start|>"],
+            V["assistant"],
+            V["<|channel|>"],
+            V["commentary"],
+            V[" to="],
+            V["functions."],
+            V["get_weather"],
+            V["<|message|>"],
+            V["{"],
+            V['"'],
+            V["query"],
+            V['"'],
+            V[":"],
+            V['"'],
+            V["hello"],
+            V['"'],
+            V["}"],
+            V["<|end|>"],
+            V["<|call|>"],
+        ]
+        assert _compile_and_run(xgr_compiler, ["get_weather", "search"], seq)
+
+
+# ---------------------------------------------------------------------------
+# Sequence ordering edge cases
+# ---------------------------------------------------------------------------
+
+
+class TestXgrammarSequenceOrdering:
+    """Test atypical but valid orderings of non_tool_blocks."""
+
+    def test_commentary_then_analysis_then_tool(self, xgr_compiler) -> None:
+        """Commentary preamble -> analysis -> tool call (reversed order)."""
+        seq = [
+            # commentary preamble first
+            V["commentary"],
+            V["<|message|>"],
+            V["Let me"],
+            V[" call"],
+            V["<|end|>"],
+            V["<|start|>"],
+            V["assistant"],
+            V["<|channel|>"],
+            # then analysis
+            V["analysis"],
+            V["<|message|>"],
+            V["I need"],
+            V[" to check"],
+            V["<|end|>"],
+            V["<|start|>"],
+            V["assistant"],
+            V["<|channel|>"],
+            # then tool call
+            V["commentary"],
+            V[" to="],
+            V["functions."],
+            V["get_weather"],
+            V["<|message|>"],
+            V["{"],
+            V["}"],
+            V["<|end|>"],
+            V["<|call|>"],
+        ]
+        assert _compile_and_run(xgr_compiler, ["get_weather"], seq)
+
+    def test_analysis_between_tool_calls(self, xgr_compiler) -> None:
+        """Tool call -> analysis -> second tool call (more_tool path)."""
+        seq = [
+            # tool call 1
+            V["commentary"],
+            V[" to="],
+            V["functions."],
+            V["get_weather"],
+            V["<|message|>"],
+            V["{"],
+            V["}"],
+            V["<|end|>"],
+            V["<|call|>"],
+            # analysis between tools (inside more_tool)
+            V["<|start|>"],
+            V["assistant"],
+            V["<|channel|>"],
+            V["analysis"],
+            V["<|message|>"],
+            V["I need"],
+            V[" to check"],
+            V["<|end|>"],
+            V["<|start|>"],
+            V["assistant"],
+            V["<|channel|>"],
+            # tool call 2
+            V["commentary"],
+            V[" to="],
+            V["functions."],
+            V["search"],
+            V["<|message|>"],
+            V["{"],
+            V["}"],
+            V["<|end|>"],
+            V["<|call|>"],
+        ]
+        assert _compile_and_run(xgr_compiler, ["get_weather", "search"], seq)
+
+
+# ---------------------------------------------------------------------------
+# Advanced blocking tests
+# ---------------------------------------------------------------------------
+
+
+class TestXgrammarBlockingAdvanced:
+    """Advanced blocking tests for production edge cases."""
+
+    def test_start_token_rejected_at_root(self, xgr_compiler) -> None:
+        """<|start|> must not be accepted at the very beginning."""
+        grammar = OpenAIToolParser._build_tool_required_grammar(["get_weather"])
+        ctx = xgr_compiler.compile_grammar(grammar)
+        matcher = xgrammar.GrammarMatcher(ctx)
+        assert not matcher.accept_token(V["<|start|>"])
+
+    def test_message_token_rejected_at_root(self, xgr_compiler) -> None:
+        """<|message|> must not be accepted at root."""
+        grammar = OpenAIToolParser._build_tool_required_grammar(["get_weather"])
+        ctx = xgr_compiler.compile_grammar(grammar)
+        matcher = xgrammar.GrammarMatcher(ctx)
+        assert not matcher.accept_token(V["<|message|>"])
+
+    def test_arbitrary_text_rejected_at_root(self, xgr_compiler) -> None:
+        """Plain text like 'hello' must not be accepted at root."""
+        grammar = OpenAIToolParser._build_tool_required_grammar(["get_weather"])
+        ctx = xgr_compiler.compile_grammar(grammar)
+        matcher = xgrammar.GrammarMatcher(ctx)
+        assert not matcher.accept_token(V["hello"])
+
+    def test_finally_blocked_at_channel_position(self, xgr_compiler) -> None:
+        """' finally' (space+finally) must be blocked at channel pos."""
+        seq = [
+            V["analysis"],
+            V["<|message|>"],
+            V["hello"],
+            V["<|end|>"],
+            V["<|start|>"],
+            V["assistant"],
+            V["<|channel|>"],
+            V[" finally"],  # blocked
+        ]
+        _compile_and_check_blocked(xgr_compiler, ["get_weather"], seq, blocked_at=7)
+
+    def test_tool_call_without_call_not_terminated(self, xgr_compiler) -> None:
+        """Tool block without trailing <|call|> must not terminate."""
+        grammar = OpenAIToolParser._build_tool_required_grammar(["get_weather"])
+        ctx = xgr_compiler.compile_grammar(grammar)
+        matcher = xgrammar.GrammarMatcher(ctx)
+        seq = [
+            V["commentary"],
+            V[" to="],
+            V["functions."],
+            V["get_weather"],
+            V["<|message|>"],
+            V["{"],
+            V["}"],
+            V["<|end|>"],
+        ]
+        for tid in seq:
+            assert matcher.accept_token(tid)
+        assert not matcher.is_terminated()
+
+    def test_root_bitmask_only_allows_channels(self, xgr_compiler) -> None:
+        """At root position, only 'analysis' and 'commentary' are valid."""
+        grammar = OpenAIToolParser._build_tool_required_grammar(["get_weather"])
+        ctx = xgr_compiler.compile_grammar(grammar)
+        matcher = xgrammar.GrammarMatcher(ctx)
+
+        bitmask = xgrammar.allocate_token_bitmask(1, len(VOCAB))
+        matcher.fill_next_token_bitmask(bitmask, 0)
+        assert _bitmask_allowed(bitmask, V["analysis"])
+        assert _bitmask_allowed(bitmask, V["commentary"])
+        assert not _bitmask_allowed(bitmask, V["final"])
+        assert not _bitmask_allowed(bitmask, V["<|start|>"])
+        assert not _bitmask_allowed(bitmask, V["<|message|>"])
+        assert not _bitmask_allowed(bitmask, V["<|return|>"])
+        assert not _bitmask_allowed(bitmask, V["hello"])
+        assert not _bitmask_allowed(bitmask, V["<|eos|>"])
+
+
+# ---------------------------------------------------------------------------
+# Content edge cases
+# ---------------------------------------------------------------------------
+
+
+class TestXgrammarContentEdgeCases:
+    """Test content patterns that could trip up the grammar."""
+
+    def test_content_with_newlines(self, xgr_compiler) -> None:
+        """Content containing newline characters."""
+        seq = [
+            V["analysis"],
+            V["<|message|>"],
+            V["hello"],
+            V["\n"],
+            V["world"],
+            V["\n"],
+            V["<|end|>"],
+            V["<|start|>"],
+            V["assistant"],
+            V["<|channel|>"],
+            V["commentary"],
+            V[" to="],
+            V["functions."],
+            V["get_weather"],
+            V["<|message|>"],
+            V["{"],
+            V["}"],
+            V["<|end|>"],
+            V["<|call|>"],
+        ]
+        assert _compile_and_run(xgr_compiler, ["get_weather"], seq)
+
+    def test_content_with_json_structure(self, xgr_compiler) -> None:
+        """Analysis content that looks like JSON."""
+        seq = [
+            V["analysis"],
+            V["<|message|>"],
+            V["{"],
+            V['"'],
+            V["query"],
+            V['"'],
+            V[":"],
+            V["["],
+            V['"'],
+            V["hello"],
+            V['"'],
+            V[","],
+            V['"'],
+            V["world"],
+            V['"'],
+            V["]"],
+            V["}"],
+            V["<|end|>"],
+            V["<|start|>"],
+            V["assistant"],
+            V["<|channel|>"],
+            V["commentary"],
+            V[" to="],
+            V["functions."],
+            V["get_weather"],
+            V["<|message|>"],
+            V["{"],
+            V["}"],
+            V["<|end|>"],
+            V["<|call|>"],
+        ]
+        assert _compile_and_run(xgr_compiler, ["get_weather"], seq)
+
+    def test_content_with_multiple_lt_chars(self, xgr_compiler) -> None:
+        """Content with multiple '<' characters in sequence."""
+        seq = [
+            V["analysis"],
+            V["<|message|>"],
+            V["x"],
+            V[" < "],
+            V["x"],
+            V["<="],
+            V["x"],
+            V[" < "],
+            V["x"],
+            V["<|end|>"],
+            V["<|start|>"],
+            V["assistant"],
+            V["<|channel|>"],
+            V["commentary"],
+            V[" to="],
+            V["functions."],
+            V["search"],
+            V["<|message|>"],
+            V["{"],
+            V["}"],
+            V["<|end|>"],
+            V["<|call|>"],
+        ]
+        assert _compile_and_run(xgr_compiler, ["search"], seq)
