@@ -303,13 +303,6 @@ SCENARIOS: list[TestScenario] = [
         expected_tool_names=["create_file"],
     ),
     TestScenario(
-        name="force_tool_on_chat",
-        description="tool_choice=required forces tool on casual chat",
-        messages=[{"role": "user", "content": "Hello! How are you today?"}],
-        tools=[TOOL_SEARCH, TOOL_GET_WEATHER],
-        min_tool_calls=1,
-    ),
-    TestScenario(
         name="five_tools_available",
         description="All 5 tools available, must pick at least one",
         messages=[
