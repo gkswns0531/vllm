@@ -149,6 +149,18 @@ TOOL_DATABASE_QUERY = {
     },
 }
 
+TOOL_GET_TIME = {
+    "type": "function",
+    "function": {
+        "name": "get_current_time",
+        "description": "Get the current time in a timezone",
+        "parameters": {
+            "type": "object",
+            "properties": {},
+        },
+    },
+}
+
 
 # ---------------------------------------------------------------------------
 # Test scenarios
@@ -314,6 +326,113 @@ SCENARIOS: list[TestScenario] = [
         ],
         min_tool_calls=1,
     ),
+    # 11. Parallel tool calls — multiple calls in single response
+    TestScenario(
+        name="parallel_tool_calls",
+        description="Expect 2+ tool calls for multi-city weather",
+        messages=[
+            {
+                "role": "user",
+                "content": (
+                    "I need the weather in Tokyo, Seoul, and London. "
+                    "Check all three cities."
+                ),
+            }
+        ],
+        tools=[TOOL_GET_WEATHER],
+        expected_tool_names=["get_weather"],
+        min_tool_calls=2,
+    ),
+    # 12. Multi-turn with tool result
+    TestScenario(
+        name="multi_turn_with_tool_result",
+        description="Follow-up after tool result (full tool loop)",
+        messages=[
+            {"role": "user", "content": "What's the weather in Paris?"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_001",
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "arguments": '{"location": "Paris"}',
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_001",
+                "content": '{"temperature": 18, "unit": "celsius", '
+                '"condition": "cloudy"}',
+            },
+            {
+                "role": "user",
+                "content": "Now search for indoor activities in Paris.",
+            },
+        ],
+        tools=[TOOL_GET_WEATHER, TOOL_SEARCH],
+        expected_tool_names=["search"],
+    ),
+    # 13. Korean / Unicode content
+    TestScenario(
+        name="korean_unicode",
+        description="Non-English user message (Korean)",
+        messages=[
+            {
+                "role": "user",
+                "content": "서울의 현재 날씨를 알려주세요. 기온이 영하인지 확인해줘.",
+            }
+        ],
+        tools=[TOOL_GET_WEATHER],
+        expected_tool_names=["get_weather"],
+    ),
+    # 14. System message present
+    TestScenario(
+        name="with_system_message",
+        description="System prompt + user request",
+        messages=[
+            {
+                "role": "system",
+                "content": "You are a helpful assistant. "
+                "Always use tools when available.",
+            },
+            {
+                "role": "user",
+                "content": "What is the weather in Berlin?",
+            },
+        ],
+        tools=[TOOL_GET_WEATHER, TOOL_SEARCH],
+        expected_tool_names=["get_weather"],
+    ),
+    # 15. No-argument tool
+    TestScenario(
+        name="no_arg_tool",
+        description="Tool with no required parameters",
+        messages=[{"role": "user", "content": "What time is it right now?"}],
+        tools=[TOOL_GET_TIME],
+        expected_tool_names=["get_current_time"],
+    ),
+    # 16. Chain of reasoning requiring multiple tools
+    TestScenario(
+        name="chain_reasoning",
+        description="Request implies tool chaining (weather then calc)",
+        messages=[
+            {
+                "role": "user",
+                "content": (
+                    "Get the temperature in Tokyo and calculate "
+                    "the conversion from Celsius to Fahrenheit "
+                    "using the formula F = C * 9/5 + 32."
+                ),
+            }
+        ],
+        tools=[TOOL_GET_WEATHER, TOOL_CALCULATE],
+        min_tool_calls=1,
+    ),
 ]
 
 
@@ -333,22 +452,75 @@ class TestResult:
     raw_response: dict | None = None
 
 
+def _validate_tool_args(
+    tool_call: dict,
+    tool_defs: list[dict],
+) -> str | None:
+    """Validate tool call arguments against the tool's schema.
+
+    Returns error string if invalid, None if OK.
+    """
+    name = tool_call["name"]
+    args_str = tool_call["arguments"]
+
+    # 1. JSON parse
+    try:
+        args = json.loads(args_str)
+    except json.JSONDecodeError:
+        return f"{name}: invalid JSON: {args_str[:100]}"
+
+    # 2. Find matching tool definition
+    tool_def = None
+    for t in tool_defs:
+        if t["function"]["name"] == name:
+            tool_def = t
+            break
+    if tool_def is None:
+        return f"{name}: not found in tool definitions"
+
+    # 3. Check required fields
+    params = tool_def["function"].get("parameters", {})
+    required = params.get("required", [])
+    for field_name in required:
+        if field_name not in args:
+            return f"{name}: missing required field '{field_name}'"
+
+    return None
+
+
 def run_scenario(
     client: OpenAI,
     model: str,
     scenario: TestScenario,
     verbose: bool = False,
+    temperature: float | None = None,
+    max_tokens: int | None = None,
 ) -> TestResult:
     logger.info("--- [%s] %s ---", scenario.name, scenario.description)
 
+    # Log request
+    if verbose:
+        logger.debug(
+            "  Request messages:\n%s",
+            json.dumps(scenario.messages, indent=2, ensure_ascii=False),
+        )
+        tool_names = [t["function"]["name"] for t in scenario.tools]
+        logger.debug("  Tools: %s", tool_names)
+
+    kwargs: dict = {
+        "model": model,
+        "messages": scenario.messages,
+        "tools": scenario.tools,
+        "tool_choice": "required",
+    }
+    if temperature is not None:
+        kwargs["temperature"] = temperature
+    if max_tokens is not None:
+        kwargs["max_tokens"] = max_tokens
+
     t0 = time.monotonic()
     try:
-        response = client.chat.completions.create(
-            model=model,
-            messages=scenario.messages,
-            tools=scenario.tools,
-            tool_choice="required",
-        )
+        response = client.chat.completions.create(**kwargs)
     except Exception as e:
         logger.error("  API error: %s", e)
         return TestResult(scenario=scenario.name, passed=False, error=str(e))
@@ -361,7 +533,8 @@ def run_scenario(
     # Log raw response
     if verbose:
         logger.debug(
-            "  Raw response:\n%s", json.dumps(raw, indent=2, ensure_ascii=False)
+            "  Raw response:\n%s",
+            json.dumps(raw, indent=2, ensure_ascii=False),
         )
 
     # Extract tool calls
@@ -374,16 +547,11 @@ def run_scenario(
                 "arguments": tc.function.arguments,
             }
             tool_calls_data.append(tc_info)
-            logger.info("  Tool call: %s(%s)", tc.function.name, tc.function.arguments)
-
-            # Validate JSON arguments
-            try:
-                json.loads(tc.function.arguments)
-            except json.JSONDecodeError:
-                logger.warning(
-                    "  WARNING: Invalid JSON in arguments: %s",
-                    tc.function.arguments,
-                )
+            logger.info(
+                "  Tool call: %s(%s)",
+                tc.function.name,
+                tc.function.arguments,
+            )
 
     content = msg.content
     if content:
@@ -393,13 +561,15 @@ def run_scenario(
     passed = True
     error_parts = []
 
+    # Check min tool calls
     if len(tool_calls_data) < scenario.min_tool_calls:
-        passed = False
         got = len(tool_calls_data)
+        passed = False
         error_parts.append(
             f"Expected >= {scenario.min_tool_calls} tool calls, got {got}"
         )
 
+    # Check tool names
     if scenario.expected_tool_names and tool_calls_data:
         actual_names = {tc["name"] for tc in tool_calls_data}
         expected = set(scenario.expected_tool_names)
@@ -407,14 +577,27 @@ def run_scenario(
         if not actual_names.issubset(valid):
             passed = False
             error_parts.append(f"Got unexpected tool names: {actual_names}")
-        # Check at least one expected tool was called
         if expected and not actual_names & expected:
             passed = False
             error_parts.append(f"Expected one of {expected}, got {actual_names}")
 
-    if choice.finish_reason == "error":
+    # Check finish_reason
+    fr = choice.finish_reason
+    if fr == "error":
         passed = False
         error_parts.append("finish_reason=error")
+    elif fr == "length":
+        passed = False
+        error_parts.append("finish_reason=length (output truncated)")
+    elif tool_calls_data and fr not in ("tool_calls", "stop"):
+        logger.warning("  Unexpected finish_reason: %s", fr)
+
+    # Validate JSON arguments against tool schema
+    for tc in tool_calls_data:
+        err = _validate_tool_args(tc, scenario.tools)
+        if err:
+            passed = False
+            error_parts.append(f"Schema validation: {err}")
 
     result = TestResult(
         scenario=scenario.name,
@@ -428,10 +611,11 @@ def run_scenario(
 
     status = "PASS" if passed else "FAIL"
     logger.info(
-        "  Result: %s (%.0fms, %d tool calls)",
+        "  Result: %s (%.0fms, %d tool calls, finish=%s)",
         status,
         latency,
         len(tool_calls_data),
+        fr,
     )
     if not passed:
         logger.error("  Error: %s", result.error)
@@ -444,13 +628,22 @@ def run_all(
     model: str,
     iterations: int,
     verbose: bool,
+    temperature: float | None = None,
+    max_tokens: int | None = None,
 ) -> list[TestResult]:
     all_results: list[TestResult] = []
 
     for i in range(iterations):
         logger.info("========== Iteration %d/%d ==========", i + 1, iterations)
         for scenario in SCENARIOS:
-            result = run_scenario(client, model, scenario, verbose)
+            result = run_scenario(
+                client,
+                model,
+                scenario,
+                verbose,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
             all_results.append(result)
 
     return all_results
@@ -512,10 +705,18 @@ def main() -> None:
     )
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose logging")
     parser.add_argument("--log-dir", default=None, help="Directory to save log files")
+    parser.add_argument("--scenario", default=None, help="Run only this scenario")
     parser.add_argument(
-        "--scenario",
+        "--temperature",
+        type=float,
         default=None,
-        help="Run only this scenario (by name)",
+        help="Sampling temperature (0 for deterministic)",
+    )
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=None,
+        help="Max tokens for generation",
     )
 
     args = parser.parse_args()
@@ -533,7 +734,14 @@ def main() -> None:
             logger.error("Scenario '%s' not found", args.scenario)
             sys.exit(1)
 
-    results = run_all(client, args.model, args.iterations, args.verbose)
+    results = run_all(
+        client,
+        args.model,
+        args.iterations,
+        args.verbose,
+        temperature=args.temperature,
+        max_tokens=args.max_tokens,
+    )
     print_summary(results, args.iterations)
 
     # Exit code
