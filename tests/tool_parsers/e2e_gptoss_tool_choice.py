@@ -519,6 +519,7 @@ def run_scenario(
             tools=scenario.tools,
             tool_choice="required",
             temperature=0,
+            max_tokens=1024,
         )
     except Exception as e:
         logger.error("  API error: %s", e)
