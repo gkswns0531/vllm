@@ -273,6 +273,10 @@ class OpenAIServingChat(OpenAIServing):
             conversation, engine_prompts = self._make_request_with_harmony(
                 request, should_include_tools
             )
+            # Apply tool parser adjustments for Harmony
+            # (e.g., EBNF grammar for tool_choice=required)
+            if tool_parser is not None:
+                request = tool_parser(tokenizer).adjust_request(request=request)
 
         return conversation, engine_prompts
 
